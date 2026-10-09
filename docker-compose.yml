@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  # 1. MongoDB 数据库服务
+  mongodb:
+    image: mongo:latest
+    container_name: agent-mongo
+    restart: always
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  # 2. RabbitMQ 消息队列（带 Web 管理界面）
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: agent-rabbitmq
+    restart: always
+    ports:
+      - "5672:5672"     # 核心 AMQP 协议端口（Go 业务代码连接）
+      - "15672:15672"   # 可视化 Web 控制台端口
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  # 3. Redis 内存缓存服务
+  redis:
+    image: redis:alpine
+    container_name: agent-redis
+    restart: always
+    ports:
+      - "6379:6379"
+
+volumes:
+  mongo_data:
+  rabbitmq_data:
