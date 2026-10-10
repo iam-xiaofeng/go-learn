@@ -20,3 +20,8 @@ Thumbs.db
 
 # Local env files
 .env.local
+
+# Profiles and logs
+*.pb.gz
+*.log
+

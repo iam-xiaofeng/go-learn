@@ -61,7 +61,7 @@ func main() {
 		repo = repository.NewMemoryRepository()
 	}
 
-	// 2. 初始化 Redis 缓存层（如果可用，包装成缓存装饰器）
+	// 2. 初始化 Redis 缓存层与 Write-Behind 异步落盘层
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
 		redisURL = "localhost:6379"
@@ -74,11 +74,20 @@ func main() {
 	})
 	redisCtx, cancelRedis := context.WithTimeout(ctx, 1*time.Second)
 	defer cancelRedis()
+
+	var writeBehindRepo *repository.WriteBehindRepository
 	if rdb.Ping(redisCtx).Err() == nil {
 		log.Println("✅ [Cache] Successfully connected to Redis (PoolSize: 300) at:", redisURL)
+		// 读链路：Session 走 Redis 缓存加速
 		repo = repository.NewCachedRepository(repo, rdb, 30*time.Minute)
+
+		// 写链路：Message 走 Redis List/Stream AOF 缓冲 + 后台批量刷盘 MongoDB (Write-Behind)
+		writeBehindRepo = repository.NewWriteBehindRepository(repo, rdb, "buffer:messages", 100, 10*time.Millisecond, 4)
+		writeBehindRepo.Start()
+		defer writeBehindRepo.Close()
+		repo = writeBehindRepo
 	} else {
-		log.Println("⚠️  [Cache] Redis not reachable, skipping cache layer.")
+		log.Println("⚠️  [Cache] Redis not reachable, skipping cache & write-behind layer.")
 	}
 
 	// 3. 初始化消息队列 (两级高并发架构：进程内 50000 缓冲 + 10 独立 Publisher + 10 独立 Consumer)

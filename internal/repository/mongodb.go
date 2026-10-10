@@ -48,11 +48,27 @@ func (m *MongoRepository) GetSession(ctx context.Context, id string) (*model.Ses
 	return &session, nil
 }
 
-// SaveMessage 保存对话消息
+// SaveMessage 保存单条对话消息
 func (m *MongoRepository) SaveMessage(ctx context.Context, msg *model.Message) error {
 	_, err := m.messagesCol.InsertOne(ctx, msg)
 	if err != nil {
 		return fmt.Errorf("failed to insert message: %w", err)
+	}
+	return nil
+}
+
+// SaveMessagesBatch 批量保存对话消息（Write-Behind 核心落盘动作，使用 InsertMany 削减磁盘 IO）
+func (m *MongoRepository) SaveMessagesBatch(ctx context.Context, msgs []*model.Message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+	docs := make([]any, len(msgs))
+	for i, msg := range msgs {
+		docs[i] = msg
+	}
+	_, err := m.messagesCol.InsertMany(ctx, docs)
+	if err != nil {
+		return fmt.Errorf("failed to insert batch messages: %w", err)
 	}
 	return nil
 }

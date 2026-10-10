@@ -30,6 +30,7 @@ services:
     image: redis:alpine
     container_name: agent-redis
     restart: always
+    command: redis-server --appendonly yes --appendfsync everysec
     ports:
       - "6379:6379"
 

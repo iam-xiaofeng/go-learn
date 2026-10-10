@@ -12,4 +12,5 @@ type Repository interface {
 	GetSession(ctx context.Context, id string) (*model.Session, error)
 	SaveMessage(ctx context.Context, msg *model.Message) error
 	GetSessionMessages(ctx context.Context, sessionID string) ([]model.Message, error)
+	SaveMessagesBatch(ctx context.Context, msgs []*model.Message) error
 }

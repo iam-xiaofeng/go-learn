@@ -49,6 +49,16 @@ func (m *MemoryRepository) SaveMessage(ctx context.Context, msg *model.Message) 
 	return nil
 }
 
+func (m *MemoryRepository) SaveMessagesBatch(ctx context.Context, msgs []*model.Message) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, msg := range msgs {
+		m.messages[msg.SessionID] = append(m.messages[msg.SessionID], *msg)
+	}
+	return nil
+}
+
 func (m *MemoryRepository) GetSessionMessages(ctx context.Context, sessionID string) ([]model.Message, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

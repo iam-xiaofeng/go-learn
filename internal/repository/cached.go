@@ -70,6 +70,10 @@ func (c *CachedRepository) SaveMessage(ctx context.Context, msg *model.Message) 
 	return c.underlying.SaveMessage(ctx, msg)
 }
 
+func (c *CachedRepository) SaveMessagesBatch(ctx context.Context, msgs []*model.Message) error {
+	return c.underlying.SaveMessagesBatch(ctx, msgs)
+}
+
 func (c *CachedRepository) GetSessionMessages(ctx context.Context, sessionID string) ([]model.Message, error) {
 	return c.underlying.GetSessionMessages(ctx, sessionID)
 }
