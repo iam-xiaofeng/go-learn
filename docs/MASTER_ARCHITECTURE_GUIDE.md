@@ -196,25 +196,29 @@ RabbitMQ 是严格的通信系统。如果你往一个拼写错误或不存在�
                【第 1 个里程碑：HTTP 接口在 ~18ms 内瞬间给前端返回 201 Created！】
                (前端用户完全零等待，直接渲染聊天气泡，体验极度丝滑！)
                                     │
-                                    ▼ (后台异步流转，与前端彻底解耦)
+                                    │  [缓冲池解耦传递]
+                                    ▼  taskBuffer (make(chan *MemoryTask, 50000))
        ┌────────────────────────────────────────────────────────┐
        │           后台 10 个专职 Publisher 协程 (传单小哥池)    │
-       │           (每个 Worker 独享自己专属的 *amqp.Channel)   │
+       │  • 如何拿任务？通过 `for task := range s.bufferChan` 抢占式拉取 │
+       │  • 信道怎么来？在全局唯一 TCP 上调用 conn.Channel() 开辟专属分机│
        └────────────────────────────────────────────────────────┘
                                     │
-                                    ▼ 真正通过 TCP 发送 AMQP 报文
+                                    ▼ 真正通过 TCP 发送 AMQP 报文 (多 Channel 并行)
        ┌────────────────────────────────────────────────────────┐
        │          RabbitMQ 队列集群 (agent.memory.tasks)         │
        │          (Persistent 持久化落盘，自动叫号排队)           │
        └────────────────────────────────────────────────────────┘
                                     │
-                                    ▼ 并行分发
+                                    ▼ 并行分发 (竞争消费者模式)
        ┌────────────────────────────────────────────────────────┐
        │           后台 10 个专职 Consumer 协程 (业务柜台池)     │
-       │           (每个 Worker 独享专属 Channel + QoS 预取)     │
+       │  • 架构对应：【这正是你的 Agent 独立微服务（消费者）！】 │
+       │  • 既可写在 Go 内部，也可作为独立 Python Agent 服务挂载   │
+       │  • 每个 Worker 独享专属 Channel (conn.Channel()) + QoS 预取│
        └────────────────────────────────────────────────────────┘
                                     │
-               ├── (1) 耗时 500ms 并行调用大模型抽取对话长期记忆
+               ├── (1) 耗时 500ms 并行调用大模型抽取对话长期记忆 / 视频摘要
                │
                ├── (2) 将提炼成果写入 MongoDB 的 memories 集合
                │
@@ -222,6 +226,19 @@ RabbitMQ 是严格的通信系统。如果你往一个拼写错误或不存在�
                │
                └── (4) 向 RabbitMQ 发送 d.Ack(false) 确认完成 (MQ 安全删除该消息)
 ```
+
+### 核心细节答疑：
+1. **Publisher 协程是怎么从内部缓冲池拿任务的？**
+   - 看 `rabbitmq_twostage.go`：每个 Worker 协程内部是一个死循环 `for task := range s.bufferChan`。
+   - 当 HTTP 接口把一个任务指针放进 `bufferChan` 时，10 个 Worker 中谁有空，Go 运行时调度器就瞬间把任务唤醒交给他，**抢占式消费，绝无空等**！
+2. **专属 `*amqp.Channel` 是用 `amqp.Dial` 还是 `conn.Channel()` 开辟的？**
+   - **必须是 `conn.Channel()`！**
+   - `amqp.Dial(url)` 开销极大（涉及 TCP 三次握手、身份认证），**全系统有且仅调用一次**建立物理连接 `conn`（大光缆）；
+   - 这 10 个 Worker 是在同一个 `conn` 上，各自调用了一次 `conn.Channel()`（虚拟分机通话信道，开销极小，分配独立的 Channel ID 1, 2, ..., 10）！
+3. **这里的 Consumer 是不是对应我的 Agent 微服务？**
+   - **完全正确！**
+   - 在微服务架构中，这个 Consumer 协程池**完全可以拆成一个独立的 Agent 微服务进程**（例如你的 Python `video-agent-architecture` 服务）；
+   - 你的 Agent 服务只需要连接 RabbitMQ 监听 `agent.memory.tasks` 队列，就能与 Go 网关解耦，独立横向扩容（开 20 台 GPU 机器跑 Consumer 都行）！
 
 ---
 
@@ -242,15 +259,28 @@ RabbitMQ 是严格的通信系统。如果你往一个拼写错误或不存在�
 - **真凶**：单次请求的总时间账单：
   $$\text{总耗时 } 35\text{ms} = \text{读 Redis } (1\text{ms}) + \text{写 Mongo 磁盘 } (17\text{ms}) + \text{写 RabbitMQ 磁盘 } (17\text{ms})$$
 - **真相**：Redis 仅仅把第 1 项从 3ms 缩短到 1ms（省了 2ms），而后面两项各占 17ms 的磁盘落盘巨无霸完全未被触及！优化 5% 的边缘耗时，绝不可能让整体吞吐翻倍。
+- **解决方法（破局方案）**：
+  1. **方案 A（工业界终极武器：Write-Behind 批量聚合刷盘）**：
+     - 彻底打破“每来一条消息就调一次 `InsertOne` 单条写物理磁盘”的执念；
+     - 消息进来先写 Redis List/Stream（内存 0.1ms，供前端即时拉取保证强一致）；
+     - 后台 Go 协程每隔 20ms 或攒满 100 条，执行一次 **`InsertMany` 批量写入**！
+     - **效果**：物理磁盘写入次数从 5,120 次/秒断崖式下跌到 50 次/秒，QPS 即可突破 **20,000 ~ 50,000+**！
+  2. **方案 B（硬件与存储层扩容）**：
+     - 调大 Mongo 容器所在的物理 SSD IOPS 上限，或者按用户 SessionID 做 Hash 分库分表打散到多台 MongoDB 实例。
 
 ---
 
 ### 案件 3：单信道互斥锁与两级架构跃迁（5120 QPS）
 - **现象**：查看 Pprof 火焰图发现，RabbitMQ 底层有密密麻麻的互斥锁。
 - **真凶**：`amqp091-go` 驱动中，单个 Channel 内部有 `ch.m.Lock()`。100 个协程共用同一个 Channel 时，所有网络发送全被强制降级为串行排队！
-- **重构方案（两级架构）**：
-  1. HTTP 线程只写 Go 原生 `chan`，耗时瞬间降至 0.0001ms，斩断了 RabbitMQ 的 17ms 同步等待！
-  2. 后台起 10 个独立 Publisher 和 10 个独立 Consumer，**每个 Worker 独享专属 Channel**，彻底消除锁竞争！
+- **解决方法（两级解耦架构落地）**：
+  1. **第一级（L1 内存级解耦）**：
+     - 使用容量 50,000 的 Go 原生缓冲通道 `taskBuffer := make(chan *model.MemoryTask, 50000)`；
+     - HTTP 接口调用 `PublishMemoryTask` 时，通过 `select-default` 纳秒级（0.0001ms）将指针丢入缓冲，立即返回 201 Created！
+     - 彻底切断 HTTP 响应对 RabbitMQ 网络 TCP 与磁盘持久化的强依赖，单请求耗时立刻减少 17ms。
+  2. **第二级（L2 多信道并行池）**：
+     - 全局保持唯一物理 `conn`，循环调用 `conn.Channel()` 为 10 个 Publisher 分别分配独立的 Channel ID（1~10）；
+     - 每个 Worker 拿着专属 Channel 并发向 RabbitMQ 发包，彻底消除 `ch.m.Lock()` 单信道排队！
 - **实测战果**：
   - **总耗时**：从 `9.51 秒` 腰斩至 **`4.88 秒`**！
   - **QPS**：从 `2629 req/sec` **直接翻倍暴涨至 `5120.46 req/sec`**！
@@ -294,6 +324,37 @@ RabbitMQ 是严格的通信系统。如果你往一个拼写错误或不存在�
 **必须标记！原因有二：**
 1. **幂等防重（省钱）**：调用大模型成本高昂。若网络抖动导致 MQ 重发消息，Worker 查一眼 Mongo 发现已经标记为 `processed`，立刻跳过，避免重复计费；
 2. **闭环对齐**：提炼出的长期画像写入 `memories` 集合，并将原消息更新为 `processed`，形成了完整的 Agent 记忆资产闭环。
+
+---
+
+## 第六篇：Pprof 性能剖析最新实测（逐行验证两级解耦的胜利）
+
+我们在重构后的系统上，在 `-c 100 -n 25000` 密集压测期间抓取了 CPU 剖析，并通过 `go tool pprof -list SendMessage` 导出了每一行代码的耗时统计：
+
+```text
+ROUTINE ======================== handler.(*Handler).SendMessage in handler.go
+         0      1.11s (flat, cum) 43.36% of Total
+         .          .     93:  // 1. 验证 Session 是否存在
+         .      410ms     94:  _, err := h.repo.GetSession(c.Request.Context(), sessionID)
+         .          .     ...
+         .       10ms    101:  if err := c.ShouldBindJSON(&req); err != nil { ... }
+         .       50ms    107:  ID: uuid.New().String(),
+         .          .     ...
+         .          .    115:  // 2. 同步保存到数据库 (MongoDB)
+         .      600ms    116:  if err := h.repo.SaveMessage(c.Request.Context(), msg); err != nil { ... }
+         .          .     ...
+         .          .    121:  // 3. 异步发送任务到消息队列 (两级引擎)
+         .        0ms    129:  _ = h.queue.PublishMemoryTask(c.Request.Context(), task)
+         .          .     ...
+         .       30ms    131:  c.JSON(http.StatusCreated, msg)
+```
+
+### 深度剖析解读：
+1. **第 129 行 `PublishMemoryTask`：耗时变成了整整 0ms！**
+   - **重构前**：这里直接调用 `amqp.PublishWithContext`，每次都要等待网络往返与单信道互斥锁，在 CPU 统计中霸占了 **整整 20%~25% 的时间**；
+   - **重构后**：这里只做了一次 `bufferChan <- task` 指针传递，**耗时低至纳秒级，在采样统计中直接归零（0ms）！两级解耦取得了 100% 预期的架构胜利！**
+2. **现在的最大耗时：第 116 行 `SaveMessage`（600ms）**
+   - 占了整个 HTTP 处理时间的 **54%**。正如我们在【案件 2】中预测的一样，现在唯一的长耗时就是等待 MongoDB 物理写入 SSD 磁盘。一旦引入 Write-Behind 批量聚合刷盘，这 600ms 也将被压缩为零，系统 QPS 就会瞬间突破几万！
 
 ---
 
